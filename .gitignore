@@ -1,0 +1,5 @@
+# your own settings: never commit credentials
+/etc/
+l2tp-vpn.conf
+*.log
+__pycache__/
