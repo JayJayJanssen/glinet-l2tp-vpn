@@ -1,6 +1,6 @@
 # glinet-l2tp-vpn
 
-An **L2TP/IPsec VPN client for GL.iNet routers** that do not have one. It uses strongSwan (IPsec) and xl2tpd (L2TP) from the router's own package feed, and adds:
+An **L2TP/IPsec VPN client for GL.iNet routers**  e.g. GL.iNet Opal (GL-SFT1200) that do not have one. It uses strongSwan (IPsec) and xl2tpd (L2TP) from the router's own package feed, and adds:
 
 - a control script, `l2tp-vpn start | stop | status`;
 - an optional **panel page** `VPN > L2TP VPN` (the installer asks; without it you control the VPN over SSH) with status, an on/off switch and editable connection settings (server, username, password, key);
