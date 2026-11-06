@@ -1,0 +1,136 @@
+#!/bin/sh
+CONF=/etc/l2tp-vpn.conf
+STATE=/tmp/l2tp-vpn.state
+CTL=/var/run/xl2tpd/l2tp-control
+[ -f "$CONF" ] && . "$CONF"
+
+fw_rules() {  # $1 = -I or -D
+  iptables -t nat $1 POSTROUTING -o ppp0 -j MASQUERADE
+  iptables $1 FORWARD -o ppp0 -j ACCEPT
+  iptables $1 FORWARD -i ppp0 -m conntrack --ctstate RELATED,ESTABLISHED -j ACCEPT
+}
+
+do_stop() {
+  [ -f "$STATE" ] && read IP GW DEV < "$STATE"
+  fw_rules -D 2>/dev/null
+  ip route del 0.0.0.0/1 dev ppp0 2>/dev/null
+  ip route del 128.0.0.0/1 dev ppp0 2>/dev/null
+  [ -n "$IP" ] && ip route del "$IP/32" 2>/dev/null
+  if pidof xl2tpd >/dev/null; then
+    [ -p "$CTL" ] && echo "d vpn" > "$CTL"
+    sleep 1
+    killall xl2tpd 2>/dev/null
+  fi
+  ipsec stop >/dev/null 2>&1
+  rm -f "$STATE"
+}
+
+do_start() {
+  [ -f "$STATE" ] && { echo "Already started. Run: l2tp-vpn stop"; exit 1; }
+  [ -n "$HOST" ] && [ -n "$VPN_USER" ] && [ -n "$VPN_PASS" ] && [ -n "$VPN_PSK" ] \
+    || { echo "Fill in $CONF first"; exit 1; }
+
+  IP=$(nslookup "$HOST" 2>/dev/null | sed -n '/^Name:/,$p' | grep -oE '([0-9]{1,3}\.){3}[0-9]{1,3}' | head -n1)
+  [ -n "$IP" ] || { echo "Cannot resolve $HOST"; exit 1; }
+  GW=$(ip route show default | awk '{print $3; exit}')
+  DEV=$(ip route show default | awk '{print $5; exit}')
+  [ -n "$GW" ] && [ -n "$DEV" ] || { echo "No default route (is the router online?)"; exit 1; }
+  echo "$IP $GW $DEV" > "$STATE"
+  echo "Server $HOST = $IP, via $GW on $DEV"
+
+  mkdir -p /var/run/xl2tpd /etc/xl2tpd
+  umask 077
+
+  cat > /etc/ipsec.conf <<EOF
+config setup
+    uniqueids=no
+    charondebug="ike 1, knl 1, cfg 0, net 1, esp 1, dmn 1, mgr 1"
+
+conn l2tpvpn
+    keyexchange=ikev1
+    authby=secret
+    type=transport
+    left=%defaultroute
+    leftprotoport=17/1701
+    right=$IP
+    rightprotoport=17/1701
+    ike=aes256-sha1-modp2048,aes128-sha1-modp2048,aes256-sha1-modp1024,aes128-sha1-modp1024,3des-sha1-modp1024
+    esp=aes256-sha1,aes128-sha1,3des-sha1
+    ikelifetime=8h
+    keylife=1h
+    forceencaps=yes
+    dpdaction=clear
+    dpddelay=30s
+    auto=add
+EOF
+  echo ": PSK \"$VPN_PSK\"" > /etc/ipsec.secrets
+
+  cat > /etc/xl2tpd/xl2tpd.conf <<EOF
+[global]
+port = 1701
+
+[lac vpn]
+lns = $IP
+pppoptfile = /etc/ppp/options.xl2tpd
+length bit = yes
+autodial = no
+redial = no
+ppp debug = yes
+EOF
+
+  cat > /etc/ppp/options.xl2tpd <<EOF
+name "$VPN_USER"
+password "$VPN_PASS"
+noauth
+refuse-pap
+refuse-eap
+noccp
+noipdefault
+nodefaultroute
+usepeerdns
+ipcp-accept-local
+ipcp-accept-remote
+mtu 1400
+mru 1400
+connect-delay 5000
+lcp-echo-interval 30
+lcp-echo-failure 4
+EOF
+
+  ipsec start >/dev/null 2>&1
+  sleep 3
+  ipsec up l2tpvpn >/dev/null 2>&1
+  sleep 2
+  ipsec statusall 2>/dev/null | grep -q INSTALLED || {
+    echo "IPsec failed. Check: logread | grep -i charon | tail -40"
+    do_stop; exit 1; }
+  echo "IPsec up."
+
+  xl2tpd -c /etc/xl2tpd/xl2tpd.conf -C "$CTL"
+  sleep 1
+  echo "c vpn" > "$CTL"
+  i=0
+  while [ $i -lt 30 ]; do
+    ip addr show ppp0 2>/dev/null | grep -q inet && break
+    i=$((i+1)); sleep 1
+  done
+  ip addr show ppp0 2>/dev/null | grep -q inet || {
+    echo "PPP failed. Check: logread | grep -Ei 'xl2tpd|pppd' | tail -40"
+    do_stop; exit 1; }
+
+  ip route replace "$IP/32" via "$GW" dev "$DEV"
+  ip route add 0.0.0.0/1 dev ppp0
+  ip route add 128.0.0.0/1 dev ppp0
+  fw_rules -I
+  echo "VPN up. All traffic now goes through the tunnel."
+}
+
+case "$1" in
+  start) do_start ;;
+  stop) do_stop; echo "Stopped." ;;
+  status)
+    ipsec statusall 2>/dev/null | grep -E 'ESTABLISHED|INSTALLED'
+    ip addr show ppp0 2>/dev/null | grep inet
+    ip route | grep ppp0 ;;
+  *) echo "Usage: l2tp-vpn start|stop|status" ;;
+esac

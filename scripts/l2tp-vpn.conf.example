@@ -1,0 +1,6 @@
+# /etc/l2tp-vpn.conf - read by /usr/bin/l2tp-vpn (shell syntax, values in single quotes)
+# Do not use a single quote in any value, and no double quote in the key. Keep the file root-only: chmod 600.
+HOST='vpn.example.com'
+VPN_USER='CHANGE_ME'
+VPN_PASS='CHANGE_ME'
+VPN_PSK='CHANGE_ME'

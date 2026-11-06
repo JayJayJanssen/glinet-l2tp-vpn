@@ -1,0 +1,170 @@
+-- /usr/lib/oui-httpd/rpc/l2tp
+-- GL.iNet panel backend for the L2TP VPN: get_status, start, stop, get_config, set_config.
+-- Called through /rpc, so the panel's login and ACL apply (default deny).
+-- By design the password and PSK are plain text: get_config returns them.
+
+local STATE = "/tmp/l2tp-vpn.state"
+local BUSY  = "/tmp/l2tp-web.busy"
+local CONF  = "/etc/l2tp-vpn.conf"
+
+local function exists(p)
+    local f = io.open(p, "r")
+    if f then f:close() return true end
+    return false
+end
+
+local function run(cmd)
+    local p = io.popen(cmd .. " 2>/dev/null")
+    if not p then return "" end
+    local out = p:read("*a") or ""
+    p:close()
+    return out
+end
+
+local function is_busy()
+    local f = io.open(BUSY, "r")
+    if not f then return false end
+    local t = tonumber(f:read("*l"))
+    f:close()
+    -- a marker older than 2 minutes is stale
+    return t ~= nil and (os.time() - t) < 120
+end
+
+local function set_busy()
+    local f = io.open(BUSY, "w")
+    if f then f:write(tostring(os.time()), "\n") f:close() end
+end
+
+-- Run /usr/bin/l2tp-vpn <action> fully detached from the web server:
+-- close inherited descriptors (nginx sockets), no stdin/stdout.
+local function detach(action)
+    set_busy()
+    os.execute("( i=3; while [ $i -le 63 ]; do eval \"exec $i>&-\"; i=$((i+1)); done; " ..
+        "/usr/bin/l2tp-vpn " .. action .. " >/tmp/l2tp-vpn.out 2>&1; " ..
+        "logger -t l2tp-web < /tmp/l2tp-vpn.out; rm -f " .. BUSY .. " ) " ..
+        "</dev/null >/dev/null 2>&1 &")
+end
+
+local function status()
+    local res = { status = "off", busy = is_busy() }
+    local ppp = run("ip addr show ppp0")
+    local addr, peer = ppp:match("inet (%S+) peer (%S+)")
+    if not addr then addr = ppp:match("inet (%S+)") end
+
+    if exists(STATE) then
+        local f = io.open(STATE, "r")
+        local line = f and f:read("*l") or ""
+        if f then f:close() end
+        res.server = line:match("^(%S+)")
+    end
+
+    if addr and exists(STATE) then
+        res.status = "connected"
+        res.address = addr
+        res.peer = peer
+    elseif exists(STATE) or res.busy then
+        res.status = "connecting"
+    end
+    return res
+end
+
+local function get_status(args)
+    return status()
+end
+
+local function start(args)
+    local s = status()
+    if s.busy then return { accepted = false, reason = "busy" } end
+    if s.status ~= "off" then return { accepted = false, reason = "already_running" } end
+    detach("start")
+    return { accepted = true }
+end
+
+local function stop(args)
+    local s = status()
+    if s.busy then return { accepted = false, reason = "busy" } end
+    if s.status == "off" then return { accepted = false, reason = "not_running" } end
+    detach("stop")
+    return { accepted = true }
+end
+
+-- ---- credentials ------------------------------------------------------
+-- /etc/l2tp-vpn.conf is read by /usr/bin/l2tp-vpn as shell (KEY='value'), and its values
+-- end up inside double-quoted strings of ppp and ipsec config files. So quotes, backslashes
+-- and control characters are refused everywhere.
+
+local function valid_text(v, max)
+    return type(v) == "string" and #v >= 1 and #v <= max and not v:find("[%c\"'\\]")
+end
+
+local function valid_host(v)
+    -- hostname or IPv4 address; must not start with "-" or "." (it is passed to nslookup)
+    return type(v) == "string" and #v >= 1 and #v <= 253 and v:match("^[%w][%w%.%-]*$") ~= nil
+end
+
+local function read_conf()
+    local c = {}
+    local f = io.open(CONF, "r")
+    if not f then return c end
+    for line in f:lines() do
+        local k, v = line:match("^([%w_]+)='(.*)'$")
+        if k then c[k] = v end
+    end
+    f:close()
+    return c
+end
+
+-- create the temp file root-only first, then rename it into place (atomic, never world-readable)
+local function write_conf(c)
+    local tmp = CONF .. ".tmp"
+    os.execute("umask 077; : > " .. tmp)
+    local f = io.open(tmp, "w")
+    if not f then return false end
+    local ok = f:write("HOST='", c.host, "'\n",
+                       "VPN_USER='", c.user, "'\n",
+                       "VPN_PASS='", c.pass, "'\n",
+                       "VPN_PSK='", c.psk, "'\n")
+    local closed = f:close()
+    if not ok or not closed then os.remove(tmp) return false end
+    os.execute("chmod 600 " .. tmp)
+    if not os.rename(tmp, CONF) then os.remove(tmp) return false end
+    return true
+end
+
+local function get_config(args)
+    local c = read_conf()
+    return {
+        host = c.HOST or "",
+        user = c.VPN_USER or "",
+        password = c.VPN_PASS or "",
+        psk = c.VPN_PSK or ""
+    }
+end
+
+-- all four values are required; the whole file is rewritten
+local function set_config(args)
+    args = args or {}
+    if is_busy() then return { saved = false, error = "busy" } end
+
+    local host, user, pass, psk = args.host, args.user, args.password, args.psk
+
+    if not valid_host(host) then return { saved = false, error = "invalid_host" } end
+    if not valid_text(user, 128) then return { saved = false, error = "invalid_user" } end
+    if pass == nil or pass == "" then return { saved = false, error = "password_required" } end
+    if not valid_text(pass, 128) then return { saved = false, error = "invalid_password" } end
+    if psk == nil or psk == "" then return { saved = false, error = "psk_required" } end
+    if not valid_text(psk, 256) then return { saved = false, error = "invalid_psk" } end
+
+    if not write_conf({ host = host, user = user, pass = pass, psk = psk }) then
+        return { saved = false, error = "write_failed" }
+    end
+    return { saved = true }
+end
+
+return {
+    get_status = get_status,
+    start = start,
+    stop = stop,
+    get_config = get_config,
+    set_config = set_config
+}

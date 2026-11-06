@@ -1,0 +1,17 @@
+{
+    "index": 90,
+    "view": "l2tp",
+    "level": 2,
+    "parent": "vpn",
+    "parent_icon": "vpn",
+    "parent_index": 40,
+    "lang_hide": [
+        "zh-cn"
+    ],
+    "show_mode": [
+        "router"
+    ],
+    "disables": [
+        "portal"
+    ]
+}
