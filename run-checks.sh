@@ -19,6 +19,14 @@ if command -v node >/dev/null 2>&1; then step "node --check webui/l2tp-view-live
 else echo "(node not found: skipping the JavaScript syntax check)"; fi
 echo "--- the installer's wait for the panel"
 sh tools/test_wait_for_panel.sh | tail -1 | grep -q " 0 failed" && echo "wait_for_panel: ok" || { echo "wait_for_panel: FAILED"; fail=1; }
+echo "--- the DNS handling"
+sh tools/test_dns.sh | tail -1 | grep -q " 0 failed" && echo "DNS tests: ok" || { echo "DNS tests: FAILED"; fail=1; }
+echo "--- the reconnect loop"
+sh tools/test_keeper.sh | tail -1 | grep -q " 0 failed" && echo "reconnect loop tests: ok" || { echo "reconnect loop tests: FAILED"; fail=1; }
+echo "--- the panel backend"
+texlua tools/test_module.lua | tail -1 | grep -q " 0 failed" && echo "backend tests: ok" || { echo "backend tests: FAILED"; fail=1; }
+echo "--- the panel page"
+node tools/test_page.js | tail -1 | grep -q " 0 failed" && echo "page tests: ok" || { echo "page tests: FAILED"; fail=1; }
 echo "--- installer consistency"
 python3 tools/check_installer.py || fail=1
 [ "$fail" = 0 ] && echo "all checks passed" || echo "SOME CHECKS FAILED"

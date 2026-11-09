@@ -1,11 +1,14 @@
 -- /usr/lib/oui-httpd/rpc/l2tp
 -- GL.iNet panel backend for the L2TP VPN: get_status, start, stop, get_config, set_config.
+-- Besides the four connection values, set_config and get_config carry two reconnect settings:
+-- retry_minutes (0 to 60, default 5, 0 = do not reconnect) and giveup_hours (0 to 168, default 0 = never).
 -- Called through /rpc, so the panel's login and ACL apply (default deny).
 -- By design the password and PSK are plain text: get_config returns them.
 
 local STATE = "/tmp/l2tp-vpn.state"
 local BUSY  = "/tmp/l2tp-web.busy"
 local CONF  = "/etc/l2tp-vpn.conf"
+local MSG   = "/tmp/l2tp-vpn.msg"   -- why the reconnect loop switched Connect off
 
 local function exists(p)
     local f = io.open(p, "r")
@@ -45,6 +48,15 @@ local function detach(action)
         "</dev/null >/dev/null 2>&1 &")
 end
 
+local function read_msg()
+    local f = io.open(MSG, "r")
+    if not f then return nil end
+    local line = f:read("*l")
+    f:close()
+    if line and #line > 0 then return line:sub(1, 200) end
+    return nil
+end
+
 local function status()
     local res = { status = "off", busy = is_busy() }
     local ppp = run("ip addr show ppp0")
@@ -64,6 +76,8 @@ local function status()
         res.peer = peer
     elseif exists(STATE) or res.busy then
         res.status = "connecting"
+    else
+        res.message = read_msg()
     end
     return res
 end
@@ -102,6 +116,16 @@ local function valid_host(v)
     return type(v) == "string" and #v >= 1 and #v <= 253 and v:match("^[%w][%w%.%-]*$") ~= nil
 end
 
+-- a whole number lo..hi, given as a number or as a string of digits; nil otherwise
+local function to_int(v, lo, hi)
+    if type(v) == "string" then
+        if not v:match("^%d+$") then return nil end
+        v = tonumber(v)
+    end
+    if type(v) ~= "number" or v ~= math.floor(v) or v < lo or v > hi then return nil end
+    return math.floor(v)
+end
+
 local function read_conf()
     local c = {}
     local f = io.open(CONF, "r")
@@ -123,7 +147,9 @@ local function write_conf(c)
     local ok = f:write("HOST='", c.host, "'\n",
                        "VPN_USER='", c.user, "'\n",
                        "VPN_PASS='", c.pass, "'\n",
-                       "VPN_PSK='", c.psk, "'\n")
+                       "VPN_PSK='", c.psk, "'\n",
+                       "RETRY_MINUTES='", string.format("%d", c.retry), "'\n",
+                       "GIVE_UP_HOURS='", string.format("%d", c.giveup), "'\n")
     local closed = f:close()
     if not ok or not closed then os.remove(tmp) return false end
     os.execute("chmod 600 " .. tmp)
@@ -137,11 +163,14 @@ local function get_config(args)
         host = c.HOST or "",
         user = c.VPN_USER or "",
         password = c.VPN_PASS or "",
-        psk = c.VPN_PSK or ""
+        psk = c.VPN_PSK or "",
+        retry_minutes = to_int(c.RETRY_MINUTES, 0, 60) or 5,
+        giveup_hours = to_int(c.GIVE_UP_HOURS, 0, 168) or 0
     }
 end
 
--- all four values are required; the whole file is rewritten
+-- the four connection values are required; the two reconnect settings are optional (what is saved, or the default,
+-- stays when they are left out); the whole file is rewritten
 local function set_config(args)
     args = args or {}
     if is_busy() then return { saved = false, error = "busy" } end
@@ -155,7 +184,20 @@ local function set_config(args)
     if psk == nil or psk == "" then return { saved = false, error = "psk_required" } end
     if not valid_text(psk, 256) then return { saved = false, error = "invalid_psk" } end
 
-    if not write_conf({ host = host, user = user, pass = pass, psk = psk }) then
+    local cur = read_conf()
+    local retry, giveup = args.retry_minutes, args.giveup_hours
+    if retry == nil then retry = to_int(cur.RETRY_MINUTES, 0, 60) or 5
+    else
+        retry = to_int(retry, 0, 60)
+        if not retry then return { saved = false, error = "invalid_retry" } end
+    end
+    if giveup == nil then giveup = to_int(cur.GIVE_UP_HOURS, 0, 168) or 0
+    else
+        giveup = to_int(giveup, 0, 168)
+        if not giveup then return { saved = false, error = "invalid_giveup" } end
+    end
+
+    if not write_conf({ host = host, user = user, pass = pass, psk = psk, retry = retry, giveup = giveup }) then
         return { saved = false, error = "write_failed" }
     end
     return { saved = true }

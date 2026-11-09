@@ -69,7 +69,7 @@ Use `scripts/l2tp-vpn.conf.example` as the template. Copy it to the router as `/
     scp -O scripts/l2tp-vpn.conf.example root@192.168.8.1:/etc/l2tp-vpn.conf
     scp -o HostKeyAlgorithms=+ssh-rsa -O scripts/l2tp-vpn.conf.example root@192.168.8.1:/etc/l2tp-vpn.conf
 
-Then, on the router, make it private and fill in your values:
+The template also has two optional lines for reconnecting after a drop (`RETRY_MINUTES`, `GIVE_UP_HOURS`); the defaults are fine. Then, on the router, make it private and fill in your values:
 
     chmod 600 /etc/l2tp-vpn.conf
     vi /etc/l2tp-vpn.conf
@@ -97,12 +97,12 @@ Expected: `SYNTAX_OK` and a last line `esac`. If not, copy the file again.
     ping -c 3 8.8.8.8
     l2tp-vpn stop
 
-`start` prints three lines ending with `VPN up. All traffic now goes through the tunnel.` `status` should show `ESTABLISHED`, `INSTALLED, TRANSPORT`, an `inet` address on `ppp0`, and the routes `0.0.0.0/1` and `128.0.0.0/1` via `ppp0`.
+`start` prints three lines ending with `VPN up. All traffic now goes through the tunnel.` `status` should show `ESTABLISHED`, `INSTALLED, TRANSPORT`, an `inet` address on `ppp0`, the routes `0.0.0.0/1` and `128.0.0.0/1` via `ppp0`, a `DNS:` line and `Reconnect loop: running`. `start` also says whether the router's DNS now follows the server (`DNS follows the server: ...`) or why it was left unchanged; `l2tp-vpn dns` shows the details.
 On the test router the tunnel came up on the first try with the broad cipher list, using NAT traversal (ESP in UDP).
 
 ### 8. Panel page (optional)
 
-Adds **VPN > L2TP VPN**: status, server, tunnel address, an on/off switch, and a "Connection settings" box with four plain-text fields that rewrite `/etc/l2tp-vpn.conf`. Only new files are added; no existing panel file is changed.
+Adds **VPN > L2TP VPN**: status, server, tunnel address, an on/off switch, a "Connection settings" box with four plain-text fields, and an "If the connection drops" box with the two reconnect settings; both rewrite `/etc/l2tp-vpn.conf`. Only new files are added; no existing panel file is changed.
 The easy way is `sh /tmp/install.sh --web-only`. It writes the files, then **tests that calls without a login are refused** (`get_status` and `set_config`) and removes everything again if it cannot confirm that.
 On a re-install it offers to restart nginx (the web server caches modules), waits up to 20 seconds for the panel to answer, and then runs the check. If the web server still gives no answer, it removes the module and tells you to retry with `--web-only`.
 
@@ -127,9 +127,33 @@ Things to know:
 
 Turn off verbose PPP logging: `sed -i 's/ppp debug = yes/ppp debug = no/' /usr/bin/l2tp-vpn`.
 
+## Updating an existing install
+
+Re-running the installer is the way. It is safe to repeat, and it keeps your settings: `/etc/l2tp-vpn.conf` is never overwritten.
+
+1. Copy the new `scripts/install.sh` to the router, as in step 1.
+2. Stop the VPN with the old version: `l2tp-vpn stop`. A tunnel that an older version started keeps running through an update, but it has no reconnect loop and no DNS handling until it is started again.
+3. Keep copies, so that you can go back. The installer only keeps the first backup of the panel files that it ever made:
+
+       cp /usr/bin/l2tp-vpn /root/l2tp-vpn.old
+       cp /usr/lib/oui-httpd/rpc/l2tp /root/l2tp-module.prev
+       cp /www/views/gl-sdk4-ui-l2tp.common.js.gz /root/l2tp-view.prev.js.gz
+
+4. Run `sh install.sh` and answer:
+   - **Install these packages now?** `y`. They are already installed, so nothing changes; `n` cancels the whole installer before the control script is replaced. This step needs internet for `opkg update`.
+   - **Install the web panel page?** `y`, and then **Restart nginx now?** `y`. The web server caches the backend module, so without the restart the old backend keeps answering.
+5. Hard-refresh the panel in the browser (Cmd/Ctrl+Shift+R).
+6. Start the VPN with `l2tp-vpn start` and check `l2tp-vpn status`: it should end with a `DNS:` line and `Reconnect loop: running`. If it says the loop is NOT running while Connect is on, the VPN was started before the update: `l2tp-vpn stop`, then `l2tp-vpn start`.
+
+Your config file keeps its four lines. The reconnect settings use their defaults (5 minutes, never give up) until you press Save on the panel page, which adds them, or add `RETRY_MINUTES='5'` and `GIVE_UP_HOURS='0'` yourself.
+
+Without internet, or to update only the control script: `scp -O scripts/l2tp-vpn root@192.168.8.1:/usr/bin/l2tp-vpn`, then `chmod +x /usr/bin/l2tp-vpn` on the router (add `-o HostKeyAlgorithms=+ssh-rsa` if your SSH client refuses). `sh install.sh --web-only` updates only the panel files.
+
+To go back, copy the three files from step 3 to their places, run `/etc/init.d/nginx restart` (the module is cached), and refresh the browser.
+
 ## Undo and removal
 
-- Stop the VPN: `l2tp-vpn stop`
+- Stop the VPN: `l2tp-vpn stop` (this also ends the reconnect loop; do it before removing anything)
 - Remove the files: `rm -f /usr/bin/l2tp-vpn /etc/l2tp-vpn.conf`
 - Remove the packages (optional):
 
@@ -141,7 +165,7 @@ Turn off verbose PPP logging: `sed -i 's/ppp debug = yes/ppp debug = no/' /usr/b
       rm -f /usr/lib/oui-httpd/rpc/l2tp /usr/share/gl-validator.d/l2tp.lua /tmp/l2tp-web.busy
       /etc/init.d/nginx restart
 
-- A reboot also clears any running tunnel and routes, because nothing autostarts.
+- A reboot also clears any running tunnel, its routes and the reconnect loop, because nothing autostarts.
 
 ## After a firmware upgrade
 

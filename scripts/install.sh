@@ -75,9 +75,20 @@ echo "    modules and binaries OK"
 say "Writing /usr/bin/l2tp-vpn"
 cat > /usr/bin/l2tp-vpn <<'EOF_L2TP_VPN_SCRIPT'
 #!/bin/sh
-CONF=/etc/l2tp-vpn.conf
-STATE=/tmp/l2tp-vpn.state
+CONF=${L2TP_VPN_CONF:-/etc/l2tp-vpn.conf}
+STATE=${L2TP_VPN_STATE:-/tmp/l2tp-vpn.state}
 CTL=/var/run/xl2tpd/l2tp-control
+DNS_BAK=${DNS_BAK:-/tmp/l2tp-vpn.resolv.bak}            # the uplink's DNS file as it was before the tunnel
+DNS_MARK="# managed by l2tp-vpn"
+PPP_RESOLV=${PPP_RESOLV:-"/etc/ppp/resolv.conf /tmp/resolv.conf.ppp"}    # where pppd (usepeerdns) writes the server's DNS
+T0=${T0:-/tmp/l2tp-vpn.t0}                              # touched just before dialing: only DNS files newer than this count
+DNSMASQ_INIT=${DNSMASQ_INIT:-/etc/init.d/dnsmasq}
+KEEPER_PID=${KEEPER_PID:-/tmp/l2tp-vpn.keeper.pid}      # the reconnect loop, while Connect is on
+ATTEMPT_PID=${ATTEMPT_PID:-/tmp/l2tp-vpn.attempt.pid}   # a reconnect attempt that is running right now
+ATTEMPT_OUT=${ATTEMPT_OUT:-/tmp/l2tp-vpn.attempt.out}
+MSG=${L2TP_VPN_MSG:-/tmp/l2tp-vpn.msg}                  # why the loop switched Connect off (the panel shows it)
+PROC_ROUTE=${PROC_ROUTE:-/proc/net/route}
+SELF=${L2TP_VPN_SELF:-$0}
 [ -f "$CONF" ] && . "$CONF"
 
 fw_rules() {  # $1 = -I or -D
@@ -86,8 +97,74 @@ fw_rules() {  # $1 = -I or -D
   iptables $1 FORWARD -i ppp0 -m conntrack --ctstate RELATED,ESTABLISHED -j ACCEPT
 }
 
-do_stop() {
+# --- DNS: while the tunnel is up the router's DNS forwarder (dnsmasq) follows the DNS servers the L2TP server handed out ---
+is_ipv4() { echo "$1" | grep -Eq '^([0-9]{1,3}\.){3}[0-9]{1,3}$'; }
+
+peer_dns() {  # prints the DNS servers pppd got from the server (written since this start), one per line
+  for f in $PPP_RESOLV; do
+    [ -f "$f" ] && ! [ "$T0" -nt "$f" ] || continue      # written since this start (not older than the marker)
+    out=$(sed -n 's/^nameserver[[:space:]]\{1,\}\([0-9.]\{7,15\}\).*/\1/p' "$f" | while read -r a; do is_ipv4 "$a" && echo "$a"; done | head -n 3)
+    [ -n "$out" ] && { echo "$out"; return 0; }
+  done
+  return 1
+}
+
+dns_file() {  # the file dnsmasq reads its upstream servers from
+  f=$(uci -q get "dhcp.@dnsmasq[0].resolvfile" 2>/dev/null)
+  echo "${f:-/tmp/resolv.conf.auto}"
+}
+
+dns_blocked() {  # succeeds, and says why, when the file should not or cannot be changed
+  case "$(dns_file)" in
+    /tmp/*|/var/*|/run/*) ;;                           # in RAM: a power cut or restart brings the uplink's DNS back by itself
+    *) echo "dnsmasq reads a file that survives a restart ($(dns_file)), so a power cut could leave the tunnel's DNS in it"; return 0 ;;
+  esac
+  [ "$(uci -q get "dhcp.@dnsmasq[0].noresolv" 2>/dev/null)" = 1 ] && { echo "dnsmasq ignores its resolv file (noresolv)"; return 0; }
+  [ -n "$(uci -q get "dhcp.@dnsmasq[0].server" 2>/dev/null)" ] && { echo "dnsmasq has fixed DNS servers (the panel's DNS settings)"; return 0; }
+  pidof AdGuardHome >/dev/null 2>&1 && { echo "AdGuard Home is running"; return 0; }
+  return 1
+}
+
+dns_apply() {
+  if why=$(dns_blocked); then echo "DNS left unchanged: $why."; return 0; fi
+  dns=$(peer_dns) || { echo "DNS left unchanged: the server gave no DNS address."; return 0; }
+  rf=$(dns_file)
+  if [ ! -f "$DNS_BAK" ]; then                         # keep the first original, even if this runs again
+    if [ -f "$rf" ] && ! grep -q "$DNS_MARK" "$rf"; then cp "$rf" "$DNS_BAK"; else : > "$DNS_BAK"; fi
+  fi
+  { echo "$DNS_MARK"; for a in $dns; do echo "nameserver $a"; done; } > "$rf"
+  for a in $dns; do ip route replace "$a/32" dev ppp0 2>/dev/null; done      # reach them through the tunnel, whatever the uplink's subnet is
+  "$DNSMASQ_INIT" restart >/dev/null 2>&1
+  echo "DNS follows the server: $(echo $dns)."
+}
+
+dns_restore() {
+  [ -f "$DNS_BAK" ] || return 0
+  rf=$(dns_file)
+  if grep -q "$DNS_MARK" "$rf" 2>/dev/null; then       # still our file: put the uplink's back
+    cp "$DNS_BAK" "$rf"
+    "$DNSMASQ_INIT" restart >/dev/null 2>&1
+  fi                                                   # otherwise the network service rewrote it already: leave it
+  rm -f "$DNS_BAK"
+}
+
+dns_status() {
+  if [ -f "$DNS_BAK" ]; then echo "DNS: follows the VPN server ($(grep '^nameserver' "$(dns_file)" 2>/dev/null | cut -d' ' -f2 | tr '\n' ' '))"
+  else echo "DNS: not changed"; fi
+}
+
+dns_report() {
+  rf=$(dns_file)
+  echo "dnsmasq reads its upstream servers from: $rf"
+  if why=$(dns_blocked); then echo "The tunnel's DNS cannot be applied: $why."; fi
+  for f in $PPP_RESOLV; do [ -f "$f" ] && { echo "--- $f (written by pppd):"; cat "$f"; }; done
+  echo "--- $rf now:"; cat "$rf" 2>/dev/null
+  if [ -f "$DNS_BAK" ]; then echo "The server's DNS is applied (the original is kept in $DNS_BAK)."; else echo "The server's DNS is not applied."; fi
+}
+
+teardown() {   # everything the tunnel set up; the state file ("Connect is on") is kept
   [ -f "$STATE" ] && read IP GW DEV < "$STATE"
+  dns_restore
   fw_rules -D 2>/dev/null
   ip route del 0.0.0.0/1 dev ppp0 2>/dev/null
   ip route del 128.0.0.0/1 dev ppp0 2>/dev/null
@@ -98,19 +175,24 @@ do_stop() {
     killall xl2tpd 2>/dev/null
   fi
   ipsec stop >/dev/null 2>&1
-  rm -f "$STATE"
+  rm -f "$T0"
 }
 
-do_start() {
-  [ -f "$STATE" ] && { echo "Already started. Run: l2tp-vpn stop"; exit 1; }
+do_stop() {   # the user's stop: end the reconnect loop and any attempt, tear everything down, forget that Connect was on
+  stop_keeper
+  teardown
+  rm -f "$STATE" "$MSG"
+}
+
+connect() {   # one full connection; returns 0 when the tunnel is up, otherwise tears it down again and returns 1 (the state is kept)
   [ -n "$HOST" ] && [ -n "$VPN_USER" ] && [ -n "$VPN_PASS" ] && [ -n "$VPN_PSK" ] \
-    || { echo "Fill in $CONF first"; exit 1; }
+    || { echo "Fill in $CONF first"; return 1; }
 
   IP=$(nslookup "$HOST" 2>/dev/null | sed -n '/^Name:/,$p' | grep -oE '([0-9]{1,3}\.){3}[0-9]{1,3}' | head -n1)
-  [ -n "$IP" ] || { echo "Cannot resolve $HOST"; exit 1; }
+  [ -n "$IP" ] || { echo "Cannot resolve $HOST"; return 1; }
   GW=$(ip route show default | awk '{print $3; exit}')
   DEV=$(ip route show default | awk '{print $5; exit}')
-  [ -n "$GW" ] && [ -n "$DEV" ] || { echo "No default route (is the router online?)"; exit 1; }
+  [ -n "$GW" ] && [ -n "$DEV" ] || { echo "No default route (is the router online?)"; return 1; }
   echo "$IP $GW $DEV" > "$STATE"
   echo "Server $HOST = $IP, via $GW on $DEV"
 
@@ -179,9 +261,10 @@ EOF
   sleep 2
   ipsec statusall 2>/dev/null | grep -q INSTALLED || {
     echo "IPsec failed. Check: logread | grep -i charon | tail -40"
-    do_stop; exit 1; }
+    teardown; return 1; }
   echo "IPsec up."
 
+  touch "$T0"
   xl2tpd -c /etc/xl2tpd/xl2tpd.conf -C "$CTL"
   sleep 1
   echo "c vpn" > "$CTL"
@@ -192,14 +275,153 @@ EOF
   done
   ip addr show ppp0 2>/dev/null | grep -q inet || {
     echo "PPP failed. Check: logread | grep -Ei 'xl2tpd|pppd' | tail -40"
-    do_stop; exit 1; }
+    teardown; return 1; }
 
   ip route replace "$IP/32" via "$GW" dev "$DEV"
   ip route add 0.0.0.0/1 dev ppp0
   ip route add 128.0.0.0/1 dev ppp0
   fw_rules -I
+  dns_apply
   echo "VPN up. All traffic now goes through the tunnel."
 }
+
+do_start() {
+  [ -f "$STATE" ] && { echo "Already started. Run: l2tp-vpn stop"; exit 1; }
+  rm -f "$MSG"
+  connect || { do_stop; exit 1; }
+  launch_keeper
+}
+
+# --- the reconnect loop: while Connect is on and the tunnel has dropped, tear it down cleanly and try again ---
+# It is one small background shell started by "start" and ended by "stop". It costs next to nothing while the tunnel is
+# healthy: every 30 seconds it reads the routing table with shell builtins (no program is started).
+# Settings in /etc/l2tp-vpn.conf (read again when a drop is noticed):
+#   RETRY_MINUTES   0 to 60, default 5: the wait between attempts once the first two (1 and 2 minutes) failed;
+#                   0 = no automatic reconnect: a dropped tunnel switches Connect off
+#   GIVE_UP_HOURS   0 to 168, default 0 = never: stop trying (and switch Connect off) this long after the drop
+
+klog() { logger -t l2tp-keeper "$*" 2>/dev/null; }
+
+tunnel_up() {   # the tunnel's routes on ppp0 exist (they go away with the interface)
+  while read -r ifc _; do
+    [ "$ifc" = ppp0 ] && return 0
+  done < "$PROC_ROUTE"
+  return 1
+}
+
+uplink_up() {   # a default route exists and its gateway answers
+  r=$(ip route show default 2>/dev/null | head -n 1)
+  [ -n "$r" ] || return 1
+  gw=$(echo "$r" | sed -n 's/.* via \([0-9.]*\).*/\1/p')
+  [ -z "$gw" ] || ping -c 1 -W 2 "$gw" >/dev/null 2>&1
+}
+
+read_settings() {
+  RETRY_MINUTES=5; GIVE_UP_HOURS=0
+  [ -f "$CONF" ] && . "$CONF"
+  case "$RETRY_MINUTES" in ''|*[!0-9]*) RETRY_MINUTES=5 ;; esac
+  case "$GIVE_UP_HOURS" in ''|*[!0-9]*) GIVE_UP_HOURS=0 ;; esac
+  [ "$RETRY_MINUTES" -gt 60 ] && RETRY_MINUTES=60
+  [ "$GIVE_UP_HOURS" -gt 168 ] && GIVE_UP_HOURS=168
+}
+
+give_up() {   # $1 = why; Connect is switched off, and the panel shows the reason
+  klog "stopping: $1"
+  echo "$1" > "$MSG"
+  teardown
+  rm -f "$STATE"
+}
+
+time_left() {   # seconds until GIVE_UP_HOURS after the drop have passed; a huge number when there is no limit
+  if [ "$GIVE_UP_HOURS" -gt 0 ]; then echo $((t_drop + GIVE_UP_HOURS * 3600 - $(date +%s))); else echo 999999999; fi
+}
+
+give_up_text() {
+  unit=hours; [ "$GIVE_UP_HOURS" -eq 1 ] && unit=hour
+  echo "Gave up reconnecting after $GIVE_UP_HOURS $unit; Connect was switched off."
+}
+
+run_attempt() {   # one attempt as a separate process, so that "stop" can end it
+  if [ -n "$ATTEMPT_CMD" ]; then $ATTEMPT_CMD > "$ATTEMPT_OUT" 2>&1 &
+  else sh "$SELF" _attempt > "$ATTEMPT_OUT" 2>&1 &
+  fi
+  echo $! > "$ATTEMPT_PID"
+  wait $!
+  rc=$?
+  rm -f "$ATTEMPT_PID"
+  return $rc
+}
+
+attempt() {   # what an attempt does: a clean slate, then a full connection; the state stays either way
+  teardown
+  connect
+}
+
+reconnect_cycle() {   # returns 0 when the tunnel is back, 1 when it gave up or Connect was switched off
+  [ "$RETRY_MINUTES" -gt 0 ] || { give_up "The tunnel dropped and automatic reconnect is off, so Connect was switched off."; return 1; }
+  fails=0
+  while [ -f "$STATE" ]; do
+    until uplink_up; do                                  # no attempts while there is no uplink
+      [ "$(time_left)" -le 0 ] && { give_up "$(give_up_text)"; return 1; }
+      sleep 30
+      [ -f "$STATE" ] || return 1
+    done
+    klog "reconnect attempt $((fails + 1))"
+    if run_attempt; then klog "reconnected"; return 0; fi
+    [ -f "$STATE" ] || return 1
+    fails=$((fails + 1))
+    klog "attempt $fails failed: $(tail -n 1 "$ATTEMPT_OUT" 2>/dev/null)"
+    case $fails in 1) w=60 ;; 2) w=120 ;; *) w=$((RETRY_MINUTES * 60)) ;; esac      # 1, 2, then every RETRY_MINUTES
+    [ "$w" -gt $((RETRY_MINUTES * 60)) ] && w=$((RETRY_MINUTES * 60))
+    left=$(time_left)
+    [ "$left" -le 0 ] && { give_up "$(give_up_text)"; return 1; }
+    [ "$w" -gt "$left" ] && w=$left
+    sleep "$w"
+    [ -f "$STATE" ] || return 1
+    [ "$(time_left)" -le 0 ] && { give_up "$(give_up_text)"; return 1; }
+  done
+  return 1
+}
+
+keeper() {
+  trap '' HUP
+  echo $$ > "$KEEPER_PID"
+  while [ -f "$STATE" ]; do
+    if tunnel_up; then sleep 30; continue; fi
+    n=0                                                  # the routes are gone: look every 5 seconds, for about 45 seconds
+    while [ "$n" -lt 9 ] && [ -f "$STATE" ] && ! tunnel_up; do sleep 5; n=$((n + 1)); done
+    [ -f "$STATE" ] || break
+    tunnel_up && continue
+    read_settings
+    t_drop=$(date +%s)
+    klog "the tunnel dropped"
+    reconnect_cycle || break
+  done
+  rm -f "$KEEPER_PID"
+}
+
+launch_keeper() {
+  ( trap '' HUP; exec sh "$SELF" _keeper </dev/null >/dev/null 2>&1 ) &
+}
+
+stop_keeper() {   # the loop and an attempt that may be running
+  for f in "$KEEPER_PID" "$ATTEMPT_PID"; do
+    [ -f "$f" ] || continue
+    read -r pid < "$f"
+    [ -n "$pid" ] && [ "$pid" != "$$" ] && kill "$pid" 2>/dev/null
+    rm -f "$f"
+  done
+}
+
+keeper_status() {
+  if [ -f "$KEEPER_PID" ]; then
+    read -r pid < "$KEEPER_PID"
+    [ -n "$pid" ] && [ -d "/proc/$pid" ] && { echo "Reconnect loop: running"; return; }
+  fi
+  [ -f "$STATE" ] && echo "Reconnect loop: NOT running (a dropped tunnel will not be reconnected)"
+}
+
+[ -n "$L2TP_VPN_LIB" ] && return 0       # sourced by the tests: define the functions only
 
 case "$1" in
   start) do_start ;;
@@ -207,8 +429,13 @@ case "$1" in
   status)
     ipsec statusall 2>/dev/null | grep -E 'ESTABLISHED|INSTALLED'
     ip addr show ppp0 2>/dev/null | grep inet
-    ip route | grep ppp0 ;;
-  *) echo "Usage: l2tp-vpn start|stop|status" ;;
+    ip route | grep ppp0
+    dns_status
+    keeper_status ;;
+  dns) dns_report ;;
+  _attempt) attempt ;;     # used by the reconnect loop
+  _keeper) keeper ;;       # the reconnect loop itself
+  *) echo "Usage: l2tp-vpn start|stop|status|dns" ;;
 esac
 EOF_L2TP_VPN_SCRIPT
 chmod +x /usr/bin/l2tp-vpn
@@ -237,6 +464,8 @@ else
     echo "VPN_USER='$VPN_USER'"
     echo "VPN_PASS='$VPN_PASS'"
     echo "VPN_PSK='$VPN_PSK'"
+    echo "RETRY_MINUTES='5'"
+    echo "GIVE_UP_HOURS='0'"
   } > /etc/l2tp-vpn.conf
   chmod 600 /etc/l2tp-vpn.conf
   echo "    saved /etc/l2tp-vpn.conf"
@@ -256,12 +485,15 @@ if [ -d /usr/share/oui/menu.d ] && [ -d /www/views ] && [ -d /usr/lib/oui-httpd/
     cat > /tmp/l2tp.new <<'EOF_WEB_MODULE'
 -- /usr/lib/oui-httpd/rpc/l2tp
 -- GL.iNet panel backend for the L2TP VPN: get_status, start, stop, get_config, set_config.
+-- Besides the four connection values, set_config and get_config carry two reconnect settings:
+-- retry_minutes (0 to 60, default 5, 0 = do not reconnect) and giveup_hours (0 to 168, default 0 = never).
 -- Called through /rpc, so the panel's login and ACL apply (default deny).
 -- By design the password and PSK are plain text: get_config returns them.
 
 local STATE = "/tmp/l2tp-vpn.state"
 local BUSY  = "/tmp/l2tp-web.busy"
 local CONF  = "/etc/l2tp-vpn.conf"
+local MSG   = "/tmp/l2tp-vpn.msg"   -- why the reconnect loop switched Connect off
 
 local function exists(p)
     local f = io.open(p, "r")
@@ -301,6 +533,15 @@ local function detach(action)
         "</dev/null >/dev/null 2>&1 &")
 end
 
+local function read_msg()
+    local f = io.open(MSG, "r")
+    if not f then return nil end
+    local line = f:read("*l")
+    f:close()
+    if line and #line > 0 then return line:sub(1, 200) end
+    return nil
+end
+
 local function status()
     local res = { status = "off", busy = is_busy() }
     local ppp = run("ip addr show ppp0")
@@ -320,6 +561,8 @@ local function status()
         res.peer = peer
     elseif exists(STATE) or res.busy then
         res.status = "connecting"
+    else
+        res.message = read_msg()
     end
     return res
 end
@@ -358,6 +601,16 @@ local function valid_host(v)
     return type(v) == "string" and #v >= 1 and #v <= 253 and v:match("^[%w][%w%.%-]*$") ~= nil
 end
 
+-- a whole number lo..hi, given as a number or as a string of digits; nil otherwise
+local function to_int(v, lo, hi)
+    if type(v) == "string" then
+        if not v:match("^%d+$") then return nil end
+        v = tonumber(v)
+    end
+    if type(v) ~= "number" or v ~= math.floor(v) or v < lo or v > hi then return nil end
+    return math.floor(v)
+end
+
 local function read_conf()
     local c = {}
     local f = io.open(CONF, "r")
@@ -379,7 +632,9 @@ local function write_conf(c)
     local ok = f:write("HOST='", c.host, "'\n",
                        "VPN_USER='", c.user, "'\n",
                        "VPN_PASS='", c.pass, "'\n",
-                       "VPN_PSK='", c.psk, "'\n")
+                       "VPN_PSK='", c.psk, "'\n",
+                       "RETRY_MINUTES='", string.format("%d", c.retry), "'\n",
+                       "GIVE_UP_HOURS='", string.format("%d", c.giveup), "'\n")
     local closed = f:close()
     if not ok or not closed then os.remove(tmp) return false end
     os.execute("chmod 600 " .. tmp)
@@ -393,11 +648,14 @@ local function get_config(args)
         host = c.HOST or "",
         user = c.VPN_USER or "",
         password = c.VPN_PASS or "",
-        psk = c.VPN_PSK or ""
+        psk = c.VPN_PSK or "",
+        retry_minutes = to_int(c.RETRY_MINUTES, 0, 60) or 5,
+        giveup_hours = to_int(c.GIVE_UP_HOURS, 0, 168) or 0
     }
 end
 
--- all four values are required; the whole file is rewritten
+-- the four connection values are required; the two reconnect settings are optional (what is saved, or the default,
+-- stays when they are left out); the whole file is rewritten
 local function set_config(args)
     args = args or {}
     if is_busy() then return { saved = false, error = "busy" } end
@@ -411,7 +669,20 @@ local function set_config(args)
     if psk == nil or psk == "" then return { saved = false, error = "psk_required" } end
     if not valid_text(psk, 256) then return { saved = false, error = "invalid_psk" } end
 
-    if not write_conf({ host = host, user = user, pass = pass, psk = psk }) then
+    local cur = read_conf()
+    local retry, giveup = args.retry_minutes, args.giveup_hours
+    if retry == nil then retry = to_int(cur.RETRY_MINUTES, 0, 60) or 5
+    else
+        retry = to_int(retry, 0, 60)
+        if not retry then return { saved = false, error = "invalid_retry" } end
+    end
+    if giveup == nil then giveup = to_int(cur.GIVE_UP_HOURS, 0, 168) or 0
+    else
+        giveup = to_int(giveup, 0, 168)
+        if not giveup then return { saved = false, error = "invalid_giveup" } end
+    end
+
+    if not write_conf({ host = host, user = user, pass = pass, psk = psk, retry = retry, giveup = giveup }) then
         return { saved = false, error = "write_failed" }
     end
     return { saved = true }
@@ -485,9 +756,9 @@ module.exports = {
       timer: null,
       startedAt: 0,
       restartAfter: false,
-      saved: { host: "", user: "", password: "", psk: "" },
+      saved: { host: "", user: "", password: "", psk: "", retry: "5", giveup: "0" },
       configLoaded: false,
-      form: { host: "", user: "", password: "", psk: "" },
+      form: { host: "", user: "", password: "", psk: "", retry: "5", giveup: "0" },
       saving: false,
       formError: ""
     };
@@ -521,7 +792,8 @@ module.exports = {
     dirty: function () {
       var f = this.form, v = this.saved;
       return f.host !== v.host || f.user !== v.user ||
-        f.password !== v.password || f.psk !== v.psk;
+        f.password !== v.password || f.psk !== v.psk ||
+        f.retry !== v.retry || f.giveup !== v.giveup;
     },
     problem: function () {
       var f = this.form;
@@ -537,6 +809,12 @@ module.exports = {
       }
       if (!f.psk || f.psk.length > 256 || bad.test(f.psk)) {
         return "Secret key: 1 to 256 characters, no quotes or backslashes.";
+      }
+      if (!/^[0-9]{1,2}$/.test(f.retry) || Number(f.retry) > 60) {
+        return "Reconnect every: a whole number of minutes from 0 to 60 (0 = do not reconnect).";
+      }
+      if (!/^[0-9]{1,3}$/.test(f.giveup) || Number(f.giveup) > 168) {
+        return "Give up after: a whole number of hours from 0 to 168 (0 = never).";
       }
       return "";
     },
@@ -596,6 +874,8 @@ module.exports = {
         invalid_user: "The username is not valid.",
         invalid_password: "The password is not valid.",
         invalid_psk: "The secret key is not valid.",
+        invalid_retry: "Reconnect every: a whole number of minutes from 0 to 60.",
+        invalid_giveup: "Give up after: a whole number of hours from 0 to 168.",
         password_required: "Enter the password.",
         psk_required: "Enter the secret key.",
         write_failed: "The router could not write the settings."
@@ -606,12 +886,16 @@ module.exports = {
       return this.call("get_config").then(function (r) {
         self.saved = {
           host: r.host || "", user: r.user || "",
-          password: r.password || "", psk: r.psk || ""
+          password: r.password || "", psk: r.psk || "",
+          retry: String(r.retry_minutes === undefined || r.retry_minutes === null ? 5 : r.retry_minutes),
+          giveup: String(r.giveup_hours === undefined || r.giveup_hours === null ? 0 : r.giveup_hours)
         };
         self.form.host = self.saved.host;
         self.form.user = self.saved.user;
         self.form.password = self.saved.password;
         self.form.psk = self.saved.psk;
+        self.form.retry = self.saved.retry;
+        self.form.giveup = self.saved.giveup;
         self.configLoaded = true;
       }).catch(function (e) {
         self.formError = self.explain(e);
@@ -624,7 +908,9 @@ module.exports = {
       this.formError = "";
       this.call("set_config", {
         host: this.form.host, user: this.form.user,
-        password: this.form.password, psk: this.form.psk
+        password: this.form.password, psk: this.form.psk,
+        retry_minutes: parseInt(this.form.retry, 10),
+        giveup_hours: parseInt(this.form.giveup, 10)
       }).then(function (r) {
         self.saving = false;
         if (!r.saved) {
@@ -633,7 +919,8 @@ module.exports = {
         }
         self.saved = {
           host: self.form.host, user: self.form.user,
-          password: self.form.password, psk: self.form.psk
+          password: self.form.password, psk: self.form.psk,
+          retry: self.form.retry, giveup: self.form.giveup
         };
         self.notice("Settings saved.", "success");
         if (reconnect) {
@@ -781,6 +1068,9 @@ module.exports = {
       this.error
         ? h("p", { style: { marginTop: "16px", fontSize: "13px", color: "#f56c6c" } }, this.error)
         : null,
+      this.state === "off" && this.st.message
+        ? h("p", { style: { marginTop: "16px", fontSize: "13px", color: "#e6a23c" } }, this.st.message)
+        : null,
 
       h("h3", { style: { margin: "28px 0 10px", fontSize: "16px" } }, "Connection settings"),
       h("div", { style: boxStyle }, [
@@ -789,6 +1079,13 @@ module.exports = {
         field("Password", "password", ""),
         field("Secret key (PSK)", "psk", "")
       ]),
+      h("h3", { style: { margin: "28px 0 10px", fontSize: "16px" } }, "If the connection drops"),
+      h("div", { style: boxStyle }, [
+        field("Reconnect every (minutes)", "retry", "5"),
+        field("Give up after (hours)", "giveup", "0")
+      ]),
+      h("p", { style: { marginTop: "8px", fontSize: "12px", opacity: 0.7 } },
+        "When the tunnel drops and the internet is back, the router connects again: after 1 minute, after 2 more minutes, and then every number of minutes set here. 0 minutes means do not reconnect: Connect switches off. Give up after switches Connect off when this many hours have passed since the drop; 0 means never."),
       this.dirty && this.problem
         ? h("p", { style: { marginTop: "12px", fontSize: "13px", color: "#e6a23c" } }, this.problem)
         : null,
@@ -800,7 +1097,7 @@ module.exports = {
         button("Save and reconnect", this.canSave, function () { self.save(true); })
       ]),
       h("p", { style: { marginTop: "16px", fontSize: "12px", opacity: 0.7 } },
-        "Saved settings apply the next time the VPN starts. The status refreshes every few seconds.")
+        "The connection settings apply the next time the VPN starts; the reconnect settings apply from the next drop. The status refreshes every few seconds.")
     ]);
   }
 };
@@ -845,3 +1142,4 @@ say "Done. Nothing was started and nothing autostarts."
 echo "    Start:   l2tp-vpn start"
 echo "    Status:  l2tp-vpn status"
 echo "    Stop:    l2tp-vpn stop"
+echo "    If the tunnel drops while the VPN is on, it reconnects by itself (USER-GUIDE.md: When the connection drops)."

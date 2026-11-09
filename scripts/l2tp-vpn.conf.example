@@ -4,3 +4,10 @@ HOST='vpn.example.com'
 VPN_USER='CHANGE_ME'
 VPN_PASS='CHANGE_ME'
 VPN_PSK='CHANGE_ME'
+
+# After a dropped connection (optional; the panel page has both settings too):
+#   RETRY_MINUTES  0 to 60, default 5: the wait between attempts once the first two (1 and 2 minutes) failed.
+#                  0 = do not reconnect: a dropped tunnel switches Connect off.
+#   GIVE_UP_HOURS  0 to 168, default 0 = never: switch Connect off when this many hours have passed since the drop.
+RETRY_MINUTES='5'
+GIVE_UP_HOURS='0'

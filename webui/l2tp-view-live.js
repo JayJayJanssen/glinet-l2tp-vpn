@@ -16,9 +16,9 @@ module.exports = {
       timer: null,
       startedAt: 0,
       restartAfter: false,
-      saved: { host: "", user: "", password: "", psk: "" },
+      saved: { host: "", user: "", password: "", psk: "", retry: "5", giveup: "0" },
       configLoaded: false,
-      form: { host: "", user: "", password: "", psk: "" },
+      form: { host: "", user: "", password: "", psk: "", retry: "5", giveup: "0" },
       saving: false,
       formError: ""
     };
@@ -52,7 +52,8 @@ module.exports = {
     dirty: function () {
       var f = this.form, v = this.saved;
       return f.host !== v.host || f.user !== v.user ||
-        f.password !== v.password || f.psk !== v.psk;
+        f.password !== v.password || f.psk !== v.psk ||
+        f.retry !== v.retry || f.giveup !== v.giveup;
     },
     problem: function () {
       var f = this.form;
@@ -68,6 +69,12 @@ module.exports = {
       }
       if (!f.psk || f.psk.length > 256 || bad.test(f.psk)) {
         return "Secret key: 1 to 256 characters, no quotes or backslashes.";
+      }
+      if (!/^[0-9]{1,2}$/.test(f.retry) || Number(f.retry) > 60) {
+        return "Reconnect every: a whole number of minutes from 0 to 60 (0 = do not reconnect).";
+      }
+      if (!/^[0-9]{1,3}$/.test(f.giveup) || Number(f.giveup) > 168) {
+        return "Give up after: a whole number of hours from 0 to 168 (0 = never).";
       }
       return "";
     },
@@ -127,6 +134,8 @@ module.exports = {
         invalid_user: "The username is not valid.",
         invalid_password: "The password is not valid.",
         invalid_psk: "The secret key is not valid.",
+        invalid_retry: "Reconnect every: a whole number of minutes from 0 to 60.",
+        invalid_giveup: "Give up after: a whole number of hours from 0 to 168.",
         password_required: "Enter the password.",
         psk_required: "Enter the secret key.",
         write_failed: "The router could not write the settings."
@@ -137,12 +146,16 @@ module.exports = {
       return this.call("get_config").then(function (r) {
         self.saved = {
           host: r.host || "", user: r.user || "",
-          password: r.password || "", psk: r.psk || ""
+          password: r.password || "", psk: r.psk || "",
+          retry: String(r.retry_minutes === undefined || r.retry_minutes === null ? 5 : r.retry_minutes),
+          giveup: String(r.giveup_hours === undefined || r.giveup_hours === null ? 0 : r.giveup_hours)
         };
         self.form.host = self.saved.host;
         self.form.user = self.saved.user;
         self.form.password = self.saved.password;
         self.form.psk = self.saved.psk;
+        self.form.retry = self.saved.retry;
+        self.form.giveup = self.saved.giveup;
         self.configLoaded = true;
       }).catch(function (e) {
         self.formError = self.explain(e);
@@ -155,7 +168,9 @@ module.exports = {
       this.formError = "";
       this.call("set_config", {
         host: this.form.host, user: this.form.user,
-        password: this.form.password, psk: this.form.psk
+        password: this.form.password, psk: this.form.psk,
+        retry_minutes: parseInt(this.form.retry, 10),
+        giveup_hours: parseInt(this.form.giveup, 10)
       }).then(function (r) {
         self.saving = false;
         if (!r.saved) {
@@ -164,7 +179,8 @@ module.exports = {
         }
         self.saved = {
           host: self.form.host, user: self.form.user,
-          password: self.form.password, psk: self.form.psk
+          password: self.form.password, psk: self.form.psk,
+          retry: self.form.retry, giveup: self.form.giveup
         };
         self.notice("Settings saved.", "success");
         if (reconnect) {
@@ -312,6 +328,9 @@ module.exports = {
       this.error
         ? h("p", { style: { marginTop: "16px", fontSize: "13px", color: "#f56c6c" } }, this.error)
         : null,
+      this.state === "off" && this.st.message
+        ? h("p", { style: { marginTop: "16px", fontSize: "13px", color: "#e6a23c" } }, this.st.message)
+        : null,
 
       h("h3", { style: { margin: "28px 0 10px", fontSize: "16px" } }, "Connection settings"),
       h("div", { style: boxStyle }, [
@@ -320,6 +339,13 @@ module.exports = {
         field("Password", "password", ""),
         field("Secret key (PSK)", "psk", "")
       ]),
+      h("h3", { style: { margin: "28px 0 10px", fontSize: "16px" } }, "If the connection drops"),
+      h("div", { style: boxStyle }, [
+        field("Reconnect every (minutes)", "retry", "5"),
+        field("Give up after (hours)", "giveup", "0")
+      ]),
+      h("p", { style: { marginTop: "8px", fontSize: "12px", opacity: 0.7 } },
+        "When the tunnel drops and the internet is back, the router connects again: after 1 minute, after 2 more minutes, and then every number of minutes set here. 0 minutes means do not reconnect: Connect switches off. Give up after switches Connect off when this many hours have passed since the drop; 0 means never."),
       this.dirty && this.problem
         ? h("p", { style: { marginTop: "12px", fontSize: "13px", color: "#e6a23c" } }, this.problem)
         : null,
@@ -331,7 +357,7 @@ module.exports = {
         button("Save and reconnect", this.canSave, function () { self.save(true); })
       ]),
       h("p", { style: { marginTop: "16px", fontSize: "12px", opacity: 0.7 } },
-        "Saved settings apply the next time the VPN starts. The status refreshes every few seconds.")
+        "The connection settings apply the next time the VPN starts; the reconnect settings apply from the next drop. The status refreshes every few seconds.")
     ]);
   }
 };
