@@ -14,6 +14,9 @@ MSG=${L2TP_VPN_MSG:-/tmp/l2tp-vpn.msg}                  # why the loop switched 
 PROC_ROUTE=${PROC_ROUTE:-/proc/net/route}
 SELF=${L2TP_VPN_SELF:-$0}
 [ -f "$CONF" ] && . "$CONF"
+UPLOAD_MBIT=10     # cap on what goes into the tunnel, in Mbit/s (0 = no cap): the router cannot encrypt much more, and when it is overloaded the
+                   # tunnel's own control messages get lost. Change it in /etc/l2tp-vpn.extra (a line UPLOAD_MBIT=15), which the panel never rewrites.
+[ -f "${L2TP_VPN_EXTRA:-/etc/l2tp-vpn.extra}" ] && . "${L2TP_VPN_EXTRA:-/etc/l2tp-vpn.extra}"
 
 fw_rules() {  # $1 = -I or -D
   iptables -t nat $1 POSTROUTING -o ppp0 -j MASQUERADE
@@ -108,6 +111,19 @@ do_stop() {   # the user's stop: end the reconnect loop and any attempt, tear ev
   rm -f "$STATE" "$MSG"
 }
 
+shape_upload() {   # limits what is sent into the tunnel (the router's own control messages are not affected); it disappears with ppp0
+  case "$UPLOAD_MBIT" in ''|*[!0-9]*) return 0 ;; esac
+  [ "$UPLOAD_MBIT" -gt 0 ] || return 0
+  command -v tc >/dev/null 2>&1 || { echo "Upload cap not applied: the tc command is not installed (opkg install tc kmod-sched-core)."; return 0; }
+  burst=$((UPLOAD_MBIT * 3 + 10))      # kB; must be at least the rate divided by the kernel's timer rate, or the cap comes out lower than asked
+  tc qdisc del dev ppp0 root >/dev/null 2>&1
+  if tc qdisc add dev ppp0 root tbf rate "${UPLOAD_MBIT}mbit" burst "${burst}kb" latency 100ms >/dev/null 2>&1; then
+    echo "Upload into the tunnel limited to $UPLOAD_MBIT Mbit/s."
+  else
+    echo "Upload cap not applied: tc could not set it (is kmod-sched-core installed?)."
+  fi
+}
+
 connect() {   # one full connection; returns 0 when the tunnel is up, otherwise tears it down again and returns 1 (the state is kept)
   [ -n "$HOST" ] && [ -n "$VPN_USER" ] && [ -n "$VPN_PASS" ] && [ -n "$VPN_PSK" ] \
     || { echo "Fill in $CONF first"; return 1; }
@@ -123,6 +139,8 @@ connect() {   # one full connection; returns 0 when the tunnel is up, otherwise 
   mkdir -p /var/run/xl2tpd /etc/xl2tpd
   umask 077
 
+  ESP_FAST="aes128-sha1"                        # the data encryption costs CPU on every packet; AES-128 needs 10 rounds where AES-256 needs 14
+  ESP_WIDE="aes256-sha1,aes128-sha1,3des-sha1"  # what was offered before; used once if the server does not accept the line above
   cat > /etc/ipsec.conf <<EOF
 config setup
     uniqueids=no
@@ -137,7 +155,7 @@ conn l2tpvpn
     right=$IP
     rightprotoport=17/1701
     ike=aes256-sha1-modp2048,aes128-sha1-modp2048,aes256-sha1-modp1024,aes128-sha1-modp1024,3des-sha1-modp1024
-    esp=aes256-sha1,aes128-sha1,3des-sha1
+    esp=$ESP_FAST
     ikelifetime=8h
     keylife=1h
     forceencaps=yes
@@ -179,10 +197,20 @@ lcp-echo-interval 30
 lcp-echo-failure 4
 EOF
 
+  umask 022       # the files above hold the password and the key; everything started from here on (strongSwan, xl2tpd, pppd and the hooks
+                  # it runs, dnsmasq) must create world-readable files, or dnsmasq (an unprivileged user) cannot read its DNS files
   ipsec start >/dev/null 2>&1
   sleep 3
   ipsec up l2tpvpn >/dev/null 2>&1
   sleep 2
+  if ! ipsec statusall 2>/dev/null | grep -q INSTALLED; then      # the server may not accept AES-128 alone: offer the old list, once
+    echo "No agreement on AES-128 alone; trying the wider list."
+    sed -i "s/^    esp=.*/    esp=$ESP_WIDE/" /etc/ipsec.conf
+    ipsec update >/dev/null 2>&1
+    sleep 2
+    ipsec up l2tpvpn >/dev/null 2>&1
+    sleep 2
+  fi
   ipsec statusall 2>/dev/null | grep -q INSTALLED || {
     echo "IPsec failed. Check: logread | grep -i charon | tail -40"
     teardown; return 1; }
@@ -205,6 +233,7 @@ EOF
   ip route add 0.0.0.0/1 dev ppp0
   ip route add 128.0.0.0/1 dev ppp0
   fw_rules -I
+  shape_upload
   dns_apply
   echo "VPN up. All traffic now goes through the tunnel."
 }
