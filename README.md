@@ -1,4 +1,4 @@
-# glinet-l2tp-vpn: L2TP/IPsec VPN client for GL.iNet routers (GL-SFT1200 Opal)
+# L2TP/IPsec VPN client for GL.iNet router (GL-SFT1200 Opal)
 
 An **L2TP/IPsec VPN client for GL.iNet routers** that do not have one. It uses strongSwan (IPsec) and xl2tpd (L2TP) from the router's own package feed, and adds:
 
